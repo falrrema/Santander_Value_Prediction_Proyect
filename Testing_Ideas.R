@@ -3,22 +3,19 @@
 #################
 # Data loading ------------------------------------------------------------
 options(scipen=999)
-source("~/Kaggle_Santander_Value_Prediction_Challenge/Helper_Santander.R")
+source("~/Santander_Value_Prediction_Proyect/Helper_Santander.R")
 library(parallel)
 library(ranger)
 santander_libs()
-train <- fread("Kaggle_Santander_Value_Prediction_Challenge/Data/train.csv") %>% as.tibble()
-test <- fread("Kaggle_Santander_Value_Prediction_Challenge/Data/test.csv") %>% as.tibble()
+train <- fread("Santander_Value_Prediction_Proyect/Data/train.csv") %>% as.tibble()
+test <- fread("Santander_Value_Prediction_Proyect/Data/test.csv") %>% as.tibble()
 
 # Finding relevant features -----------------------------------------------
-train <- preProc_data(train, add_Xcols = TRUE, logTransform = TRUE, sparsity = 1.1, ceroVariance = FALSE, removeDuplicates = FALSE)
-test <- preProc_data(test, add_Xcols = TRUE, logTransform = TRUE, sparsity = 1.1, ceroVariance = FALSE, removeDuplicates = FALSE)
-
 rf <- ranger(target ~ ., data = train[, -1], importance = "permutation")
 rf_importance <- data_frame(predictors = names(importance(rf)), importance_value = importance(rf)) %>% 
     arrange(desc(importance_value)) %>% filter(importance_value > 0)
 rf_importance <- rf_importance[1:110,]
-saveRDS(rf_importance, "Kaggle_Santander_Value_Prediction_Challenge/Data/rf_importance.RDS")
+saveRDS(rf_importance, "Santander_Value_Prediction_Proyect/Data/rf_importance.RDS")
 
 # Row Aggregation ---------------------------------------------------------
 train_gather <- train %>%  
@@ -84,64 +81,82 @@ test_res <- pbapply::pblapply(unique(test_gather$id), function(t) {
 stopCluster(cl=cl)
 
 saveRDS(list(train_res = train_res, test_res = test_res), 
-        "Kaggle_Santander_Value_Prediction_Challenge/Data/Data_Row_Agg.RDS")
+        "Santander_Value_Prediction_Proyect/Data/Data_Row_Agg.RDS")
 
+# Dimensionality Reduction Features ---------------------------------------
+# PCA
+train <- preProc_data(train, add_Xcols = TRUE, logTransform = TRUE, sparsity = 1, ceroVariance = TRUE, removeDuplicates = TRUE)
+test <- preProc_data(test, add_Xcols = TRUE, logTransform = TRUE, sparsity = 1, ceroVariance = TRUE, removeDuplicates = TRUE)
+train_cols <- train %>% select(id, starts_with("x")) %>% names
+test <- test[, train_cols]
 
+train$target <- NULL
+set.seed(50)
+PCA_res <- principal_component_fit(train, nComp = 20, center = TRUE, scale = TRUE) # top 20 components
+test_pca <- principal_component_transform(test_df = test, pca_object = PCA_res$pc_irlba)
 
+# tSVD
+tSVD_res <- tSVD_fit(train, n_vectors = 20)
+test_svd <- tSVD_transform(test_df = test, SVD_object = tSVD_res$tSVD_res)
 
+train_dr <- PCA_res$train_pc %>% left_join(tSVD_res$train_svd, by = "id")
+test_dr <- test_pca %>% left_join(test_svd, by = "id")
+
+saveRDS(list(train_dr = train_dr, test_dr = test_dr), 
+        "Santander_Value_Prediction_Proyect/Data/Data_Dim_Red.RDS")
 
 # Modelling ---------------------------------------------------------------
-rf_importance <- readRDS("Kaggle_Santander_Value_Prediction_Challenge/Data/rf_importance.RDS")
-train <- fread("Kaggle_Santander_Value_Prediction_Challenge/Data/train.csv") %>% as.tibble()
-test <- fread("Kaggle_Santander_Value_Prediction_Challenge/Data/test.csv") %>% as.tibble()
+rf_importance <- readRDS("Santander_Value_Prediction_Proyect/Data/rf_importance.RDS")
+train <- fread("Santander_Value_Prediction_Proyect/Data/train.csv") %>% as.tibble()
+test <- fread("Santander_Value_Prediction_Proyect/Data/test.csv") %>% as.tibble()
 train <- preProc_data(train, add_Xcols = TRUE, logTransform = TRUE, sparsity = 1.1, ceroVariance = FALSE, removeDuplicates = FALSE)
 test <- preProc_data(test, add_Xcols = TRUE, logTransform = TRUE, sparsity = 1.1, ceroVariance = FALSE, removeDuplicates = FALSE)
-train <- train %>% select(id, target, rf_importance$predictors)
-test <- test %>% select(id, rf_importance$predictors)
+train <- train %>% select(id, target, rf_importance$predictors[1:50])
+test <- test %>% select(id, rf_importance$predictors[1:50])
 
-df <- readRDS("Kaggle_Santander_Value_Prediction_Challenge/Data/Data_Row_Agg.RDS")
+df <- readRDS("Santander_Value_Prediction_Proyect/Data/Data_Row_Agg.RDS")
 train <- train %>% left_join(df$train_res, by = c("id", "target"))
 test <- test %>% left_join(df$test_res, by = c("id"))
 
-adversarial_val <- readRDS("Kaggle_Santander_Value_Prediction_Challenge/Data/Adversarial_Training_Validation.RDS")
-train_id <- adversarial_val$train_id
-val_id <- adversarial_val$val_id
-tr <- train %>% filter(id %in% train_id)
-val <- train %>% filter(id %in% val_id)
+df <- readRDS("Santander_Value_Prediction_Proyect/Data/Data_Dim_Red.RDS")
+train <- train %>% left_join(df$train_dr, by = c("id"))
+test <- test %>% left_join(df$test_dr, by = c("id"))
 
-library(lightgbm)
-to_train <- tr
-to_test <- val
-to_test <- to_test[, names(to_train)]
+# Correlation Analysis ----------------------------------------------------
+correlationMatrix <- cor(train[,3:100])
+highlyCorrelated <- caret::findCorrelation(correlationMatrix, cutoff =0.8, verbose = TRUE) # cutoff over 0.8
+train <- train[, -highlyCorrelated] # removing highly correlated variables
+test <- test[, -highlyCorrelated] # removing highly correlated variables
 
-Y_tr <- to_train$target
-train_id <- to_train$id
-to_train$target <-  to_train$id <- NULL
-Y_true <- to_test$target
-val_id <- to_test$id
-to_test$target <- to_test$id <- NULL
+# Clustering --------------------------------------------------------------
+library(dendextend)
+library(cluster) 
 
-dtrain <- lgb.Dataset(data = as.matrix(to_train), label = Y_tr)
-dtest <- lgb.Dataset(data = as.matrix(to_test), label = Y_true)
-valids <- list(train = dtrain, test = dtest)
+train_norm <- train %>% select(-target, -id) %>% scale %>%  
+    as.data.frame()
+rownames(train_norm) <- train$id
 
-evalerror <- function(preds, dtrain) {
-    labels <- lightgbm::getinfo(dtrain, "label")
-    err <- MLmetrics::RMSLE(y_pred = exp10p(preds), y_true = exp10p(labels))
-    return(list(name = "RMSLE", value = err, higher_better = FALSE))
-}
+# Silhouette Analysis
+sil_width <- map_dbl(2:20, function(k) { 
+    cat("\nClustering with K = ", k)
+    model <- pam(x = train_norm, k = k) 
+    model$silinfo$avg.width
+})
 
-params <- list(boosting = "gbdt", objective = "regression", learning_rate=0.005, max_depth=4, 
-               feature_fraction = 0.5, bagging_fraction = 0.8, bagging_freq = 10, 
-               num_leaves = 20, min_data_in_bin = 30, min_gain_to_split = 1, min_data_in_leaf = 50)
-lgbcv <- lgb.cv(params = params, data = dtrain, nrounds = 1500, nfold = 3,
-                early_stopping_rounds = 20, nthread = 5, verbose = 1, eval = evalerror)
+sil_df <- data.frame(k = 2:20,  sil_width = sil_width)
+ggplot(sil_df, aes(x = k, y = sil_width)) + geom_line() +
+    scale_x_continuous(breaks = 2:20)
 
-lgb.model <- lgb.train(params = params, data = dtrain, num_threads = 7, 
-                       nrounds = 1050, eval_freq = 20, eval = evalerror)
+# Get Clusters and predict on test set
+cluster_model <- pam(x = train_norm, k = 2, keep.data = TRUE)
+plot(silhouette(cluster_model))
+cluster_model$silinfo$widths %>% View
+train$cluster <- cluster_model$clustering
 
-val$pred <- predict(lgb.model, data = as.matrix(to_test))
-val <- val %>% select(id, target, pred, starts_with("x"), mean_values_dupl:dupl)
-MLmetrics::RMSLE(y_pred = exp10p(val$pred), y_true = exp10p(val$target))
+library(FNN)
+pred_knn <- get.knnx(cluster_model$medoids, scale(test[, -1]), 1)
+test$cluster <- pred_knn$nn.index
 
+saveRDS(list(train_cluster = train, test_cluster= test),
+     "Santander_Value_Prediction_Proyect/Data/Data_Clustered.RDS")
 
