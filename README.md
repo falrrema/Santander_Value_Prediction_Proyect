@@ -1,1 +1,1 @@
-# Santander_Value_Prediction_Proyect
+# Kaggle_Santander_Value_Prediction_Challenge
