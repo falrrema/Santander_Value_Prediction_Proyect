@@ -124,9 +124,9 @@ test <- test %>% left_join(df$test_dr, by = c("id"))
 
 # Correlation Analysis ----------------------------------------------------
 correlationMatrix <- cor(train[,3:100])
-highlyCorrelated <- caret::findCorrelation(correlationMatrix, cutoff =0.8, verbose = TRUE) # cutoff over 0.8
-train <- train[, -highlyCorrelated] # removing highly correlated variables
-test <- test[, -highlyCorrelated] # removing highly correlated variables
+highlyCorrelated <- caret::findCorrelation(correlationMatrix, cutoff =0.8, verbose = TRUE, names = TRUE) # cutoff over 0.8
+train <- train %>% select(-highlyCorrelated) # removing highly correlated variables
+test <- test %>% select(-highlyCorrelated) # removing highly correlated variables
 
 # Clustering --------------------------------------------------------------
 library(dendextend)
